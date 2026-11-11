@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -18,6 +20,26 @@ st.set_page_config(page_title="제로음료 영양성분 탐색", page_icon="�
 # 예) "https://raw.githubusercontent.com/내계정/저장소이름/main/data/zero_drinks.csv"
 DATA_SOURCE = "zero_drinks.csv"
 
+
+def find_data():
+    """CSV 파일을 찾습니다.
+    1) 이 파일이 있는 폴더와 실행 폴더, 그 아래 data 폴더의 zero_drinks.csv
+    2) 그래도 없으면 어느 폴더든 '식품명, 음료종류, 에너지_kcal' 열이 있는 .csv (요약 파일 등은 열이 달라 제외)"""
+    roots = [Path(__file__).resolve().parent, Path.cwd()]
+    for root in roots:
+        for name in (DATA_SOURCE, f"data/{DATA_SOURCE}"):
+            if (root / name).exists():
+                return str(root / name)
+    for root in roots:
+        for f in sorted(root.glob("**/*.csv")):
+            try:
+                header = f.open(encoding="utf-8-sig").readline()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if all(k in header for k in ("식품명", "음료종류", "에너지_kcal")):
+                return str(f)
+    return None
+
 # 지방_g, 탄수화물_g는 결측치가 많아(45개 중 35개) 그래프에서 뺐습니다. 데이터 표에는 그대로 남아 있습니다.
 NUTRIENTS = ["에너지_kcal", "단백질_g", "당류_g", "나트륨_mg", "포화지방_g"]
 NUMERIC = NUTRIENTS + ["식품중량"]
@@ -36,11 +58,14 @@ st.title("🥤 제로음료 영양성분 탐색")
 st.caption("출처: 식품의약품안전처 식품영양성분 DB (화면을 보고 직접 옮겨 적은 사본, 자세한 내용은 data/출처.md)")
 
 uploaded = st.sidebar.file_uploader("다른 CSV로 바꿔 보기 (선택)", type="csv")
-try:
-    df_all = load_data(uploaded if uploaded is not None else DATA_SOURCE)
-except FileNotFoundError:
-    st.error(f"'{DATA_SOURCE}' 파일을 찾을 수 없습니다. app.py와 같은 위치에 data 폴더가 있는지 확인하세요.")
+source = uploaded if uploaded is not None else find_data()
+if source is None:
+    here = Path(__file__).resolve().parent
+    st.error(f"'{DATA_SOURCE}' 파일을 찾을 수 없습니다. GitHub 저장소에서 app.py와 같은 위치(또는 data 폴더)에 CSV를 올렸는지, "
+             f"이름이 정확히 {DATA_SOURCE}인지 확인하세요. 급하면 왼쪽 사이드바에서 CSV를 직접 올려도 됩니다.")
+    st.caption("앱이 지금 보고 있는 폴더의 파일: " + ", ".join(sorted(f.name for f in here.iterdir())))
     st.stop()
+df_all = load_data(source)
 
 type_order = list(dict.fromkeys(df_all["음료종류"]))  # 파일에 나온 순서대로
 
@@ -67,8 +92,8 @@ if df.empty:
 
 
 
-# 하루 섭취 계산기에 쓰는 영양성분과 하루 기준치(편집 가능한 기본값)
-# 나트륨 2,000mg은 식약처 영양표시 안내의 1일 기준치이고, 나머지도 영양표시에 쓰이는 일반 기준값입니다.
+# 하루 섭취 계산기와 음료 바꾸기에 쓰는 영양성분과 하루 기준치(편집 가능한 기본값)
+# 식약처 '1일 영양성분 기준치'(열량 2,000kcal 기준): 나트륨 2,000mg, 포화지방 15g, 당류 100g
 INTAKE_COLS = {
     "에너지_kcal": ("에너지", "kcal", 2000),
     "나트륨_mg": ("나트륨", "mg", 2000),
@@ -126,21 +151,24 @@ def train_model(data, name):
 
 
 # ------------------------------------------------ 음료 바꾸기: 교체 쌍 데이터와 로지스틱 회귀
-SWAP_METRICS = {"에너지": "에너지_kcal", "나트륨": "나트륨_mg", "포화지방": "포화지방_g"}
+SWAP_METRICS = {"에너지": "에너지_kcal", "나트륨": "나트륨_mg", "포화지방": "포화지방_g"}  # '다른 성분의 변화' 입력에 쓰는 성분
+SWAP_TARGETS = {**SWAP_METRICS, "당류": "당류_g"}  # 낮아지는지 볼 수 있는 성분 (당류는 빈 값이 많음)
 FEAT_TYPE, FEAT_SIZE, FEAT_OTHER = "음료종류(지금 → 바꿀)", "용량 변화", "다른 성분의 변화"
 
 
-def serving_table(data):
-    """한 잔 값 = 100ml(또는 100g)당 값 x 식품중량 / 100. 세 성분이 모두 있는 음료만 남깁니다."""
+def serving_table(data, target):
+    """한 잔 값 = 100ml(또는 100g)당 값 x 식품중량 / 100.
+    '다른 성분' 세 개와 정답을 만들 성분(target)의 값이 모두 있는 음료만 남깁니다."""
     s = data.copy()
-    for k, col in SWAP_METRICS.items():
+    for k, col in SWAP_TARGETS.items():
         s["한잔_" + k] = s[col] * s["식품중량"] / 100
-    return s.dropna(subset=["한잔_" + k for k in SWAP_METRICS]).reset_index(drop=True)
+    need = ["한잔_" + k for k in SWAP_METRICS] + ["한잔_" + target]
+    return s.dropna(subset=need).reset_index(drop=True)
 
 
 def make_pairs(data, target):
     """모든 (지금 음료 A -> 바꿀 음료 B) 쌍을 만들고, 정답 y = 'B로 바꾸면 한 잔 target이 낮아지는가'."""
-    s = serving_table(data)
+    s = serving_table(data, target)
     n = len(s)
     ia, ib = np.where(~np.eye(n, dtype=bool))
     A = s.iloc[ia].reset_index(drop=True)
@@ -204,6 +232,14 @@ def show_hist(col, why):
     fig.update_layout(yaxis_title="제품 수", bargap=0.05, margin=dict(t=10, b=10))
     st.plotly_chart(fig)
     st.caption(f"값이 있는 제품 {len(d)}개 · 결측 {len(df) - len(d)}개")
+
+
+# ---------------------------------------------------------------- 하루 기준치 (계산기와 음료 바꾸기 탭이 함께 사용)
+with st.sidebar.expander("하루 기준치 (계산기용)"):
+    st.caption("식약처 영양표시의 1일 영양성분 기준치(2,000kcal 기준)입니다. 개인마다 필요한 양은 다르니 필요하면 바꾸세요.")
+    refs = {}
+    for col, (label, unit, default) in INTAKE_COLS.items():
+        refs[col] = st.number_input(f"{label} ({unit})", min_value=1.0, value=float(default), step=1.0, key=f"ref_{col}")
 
 
 # ---------------------------------------------------------------- 탭
@@ -339,11 +375,7 @@ with tab5:
     st.markdown("오늘 마신 음료와 잔 수를 고르면, 에너지·나트륨·포화지방·당류가 **하루 기준치의 몇 %**인지 계산합니다. "
                 "한 잔 값은 '100ml(또는 100g)당 값 × 제품 용량 ÷ 100'으로 구하며, 왼쪽 필터와 상관없이 전체 제품에서 고릅니다.")
 
-    with st.expander("하루 기준치 바꾸기"):
-        st.caption("기본값은 영양표시에 쓰이는 일반 성인 기준값입니다. 사람마다 필요한 양은 다르니 필요하면 직접 바꾸세요.")
-        refs = {}
-        for c, (col, (label, unit, default)) in zip(st.columns(4), INTAKE_COLS.items()):
-            refs[col] = c.number_input(f"{label} ({unit})", min_value=1.0, value=float(default), step=1.0)
+    st.caption("하루 기준치는 왼쪽 사이드바의 '하루 기준치'에서 바꿀 수 있습니다.")
 
     picked = st.multiselect("오늘 마신 음료", list(df_all["식품명"]))
     if not picked:
@@ -470,7 +502,8 @@ with tab7:
     else:
         res = calc_intake(df_all, {drink_a: cups_n, drink_b: cups_n})
         rows = []
-        for col, (label, unit, ref) in INTAKE_COLS.items():
+        for col, (label, unit, _d) in INTAKE_COLS.items():
+            ref = refs[col]
             a_v, b_v = res.loc[0, col], res.loc[1, col]
             if pd.isna(a_v) or pd.isna(b_v):
                 rows.append({"성분": f"{label} ({unit})", "A": a_v, "B": b_v, "변화(B−A)": np.nan,
@@ -488,8 +521,20 @@ with tab7:
         st.caption(f"하루 {cups_n}잔 기준입니다. '차이 작음'은 하루 기준치의 1%p 미만 차이라는 뜻이고, 원본 값이 반올림돼 있어 이 정도 차이는 의미를 두기 어렵습니다. "
                    "값이 낮아졌다고 무조건 좋은 것은 아니며, 이 계산은 개인 건강 조언이 아닙니다.")
 
+        chg = cmp_df.dropna(subset=["기준치 대비 변화(%p)"])
+        if not chg.empty:
+            parts = ", ".join(f"{r['성분'].split(' (')[0]} {r['기준치 대비 변화(%p)']:+.1f}%p" for _, r in chg.iterrows())
+            st.write(f"하루 {cups_n}잔을 A에서 B로 바꾸면 **하루 기준치 대비** {parts} 달라집니다.")
+            fig = px.bar(chg, x="기준치 대비 변화(%p)", y="성분", orientation="h", text_auto=".1f")
+            fig.add_vline(x=0, line_dash="dash")
+            fig.update_layout(margin=dict(t=10, b=10), height=max(220, 60 * len(chg) + 80))
+            st.plotly_chart(fig)
+            st.caption("0보다 왼쪽이면 줄고 오른쪽이면 늘어납니다. 기준치는 식약처 1일 영양성분 기준치(2,000kcal 기준)이며 사이드바에서 바꿀 수 있습니다. "
+                       "기준치는 영양 정보를 비교하기 위한 값이지 어떤 음료가 건강에 좋은지 판정하는 기준이 아닙니다.")
+
         long = []
-        for col, (label, unit, ref) in INTAKE_COLS.items():
+        for col, (label, unit, _d) in INTAKE_COLS.items():
+            ref = refs[col]
             for who, row_i in (("A: 지금", 0), ("B: 바꾼 뒤", 1)):
                 v = res.loc[row_i, col]
                 if pd.notna(v):
@@ -504,7 +549,7 @@ with tab7:
     st.markdown("모든 (A → B) 쌍을 만들어, **B로 바꾸면 한 잔의 선택한 성분이 낮아지는가**(1) 아닌가(0)를 맞힙니다. "
                 "값이 똑같은 쌍은 뺍니다. 정답이 음료의 영양성분 값에서 바로 나오므로, 입력에는 정답을 만든 성분 자체를 넣지 않습니다.")
     cc1, cc2 = st.columns(2)
-    target = cc1.selectbox("낮아지는지 볼 성분", list(SWAP_METRICS), index=1)
+    target = cc1.selectbox("낮아지는지 볼 성분", list(SWAP_TARGETS), index=1)
     sw_feats = cc2.multiselect("입력(특징)", [FEAT_TYPE, FEAT_SIZE, FEAT_OTHER], default=[FEAT_TYPE, FEAT_SIZE, FEAT_OTHER],
                                help=f"'다른 성분의 변화'는 {target}이(가) 아닌 나머지 성분이 바뀐 정도입니다.")
     if not sw_feats:
@@ -512,6 +557,11 @@ with tab7:
     else:
         sw_model, P, s, sw_proba, sw_cat, sw_num = run_swap_model(df_all, target, tuple(sw_feats), 1.0)
         sw_y = P["y"]
+        if target == "당류":
+            n_zero = int((s["한잔_당류"] == 0).sum())
+            st.warning(f"당류는 값이 비어 있는 음료가 많아, 당류 값이 있는 음료 {len(s)}개만 사용합니다. 그중 {n_zero}개는 당류가 0이라서 "
+                       "'당류가 0인 음료로 바꾸면 낮아진다'는 거의 단순한 규칙이 점수를 크게 끌어올립니다. 값이 같은 쌍(0과 0)은 빠지고, "
+                       "값이 비어 있는 음료가 빠지면서 데이터가 한쪽으로 치우쳐 있으니 점수를 그대로 믿지 마세요.")
         sw_pred = (sw_proba >= 0.5).astype(int)
 
         st.caption("음료 하나를 통째로 빼고 학습한 뒤 그 음료가 'A'인 쌍을 맞히게 하는 방식(Leave-One-Product-Out)으로 잰 값입니다. "
@@ -539,7 +589,7 @@ with tab7:
             ia = s.index[s["식품명"] == drink_a]
             ib = s.index[s["식품명"] == drink_b]
             if len(ia) == 0 or len(ib) == 0:
-                st.info("고른 음료 중 하나는 세 성분 값이 모두 없어 모델에서 빠졌습니다.")
+                st.info(f"고른 음료 중 하나는 필요한 성분 값(에너지, 나트륨, 포화지방, {target})이 비어 있어 모델에서 빠졌습니다.")
             else:
                 hit = P.index[(P["a"] == ia[0]) & (P["b"] == ib[0])]
                 if len(hit) == 0:
